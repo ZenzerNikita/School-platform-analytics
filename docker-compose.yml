@@ -1,0 +1,37 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: adaptive-learning-app
+    restart: unless-stopped
+    environment:
+      ML_WS_URL: ws://ml_service:8001/transcriber/ws/transcribe
+      ML_WS_TIMEOUT_SEC: "300"
+      INIT_TIMEOUT_SEC: "30"
+    depends_on:
+      - ml_service
+    ports:
+      - "8000:8000"
+
+  ml_service:
+    build:
+      context: ./ml_service
+      dockerfile: Dockerfile
+    container_name: adaptive-learning-ml
+    restart: unless-stopped
+    environment:
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-small}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+      WHISPER_BEAM_SIZE: ${WHISPER_BEAM_SIZE:-5}
+      WHISPER_VAD_FILTER: ${WHISPER_VAD_FILTER:-true}
+      LLM_PROVIDER: ${LLM_PROVIDER:-heuristic}
+      ANALYTICS_PROVIDER: ${ANALYTICS_PROVIDER:-auto}
+      GROQ_PROXY_URL: ${GROQ_PROXY_URL:-http://91.103.253.236/generate}
+      GROQ_MODEL: ${GROQ_MODEL:-qwen/qwen3-32b}
+      GROQ_ANALYTICS_MODEL: ${GROQ_ANALYTICS_MODEL:-qwen/qwen3-32b}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      API_KEY_STORAGE: ${API_KEY_STORAGE:-}
+    ports:
+      - "8001:8001"

@@ -31,6 +31,12 @@ WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").strip().lower() in 
     "yes",
     "on",
 }
+PRELOAD_MODELS_ON_STARTUP = os.getenv("PRELOAD_MODELS_ON_STARTUP", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 _WHISPER_MODEL: Optional[WhisperModel] = None
 
@@ -53,15 +59,30 @@ def _resolve_whisper_model_source(model_name: str) -> str:
 def _get_model() -> WhisperModel:
     global _WHISPER_MODEL
     if _WHISPER_MODEL is None:
+        model_source = _resolve_whisper_model_source(WHISPER_MODEL_SIZE)
+        logger.info(
+            "loading whisper model size=%s source=%s device=%s compute_type=%s",
+            WHISPER_MODEL_SIZE,
+            model_source,
+            WHISPER_DEVICE,
+            WHISPER_COMPUTE_TYPE,
+        )
         _WHISPER_MODEL = WhisperModel(
-            _resolve_whisper_model_source(WHISPER_MODEL_SIZE),
+            model_source,
             device=WHISPER_DEVICE,
             compute_type=WHISPER_COMPUTE_TYPE,
         )
+        logger.info("whisper model loaded")
     return _WHISPER_MODEL
 
 
 def _transcribe_wav(path: str):
+    logger.info(
+        "starting transcription path=%s beam_size=%s vad_filter=%s",
+        path,
+        WHISPER_BEAM_SIZE,
+        WHISPER_VAD_FILTER,
+    )
     model = _get_model()
     segments, _info = model.transcribe(
         path,
@@ -69,10 +90,19 @@ def _transcribe_wav(path: str):
         beam_size=WHISPER_BEAM_SIZE,
         vad_filter=WHISPER_VAD_FILTER,
     )
-    return list(segments)
+    result = list(segments)
+    logger.info("transcription finished segments=%s", len(result))
+    return result
 
 
 def _convert_to_wav(input_path: str, output_path: str) -> None:
+    input_size = os.path.getsize(input_path) if os.path.exists(input_path) else 0
+    logger.info(
+        "converting media to wav input=%s output=%s input_bytes=%s",
+        input_path,
+        output_path,
+        input_size,
+    )
     cmd = [
         "ffmpeg",
         "-y",
@@ -88,6 +118,8 @@ def _convert_to_wav(input_path: str, output_path: str) -> None:
         output_path,
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    output_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    logger.info("media converted to wav output_bytes=%s", output_size)
 
 
 async def _send_error(
@@ -130,20 +162,53 @@ async def _send_partial_status(ws: WebSocket, text: str) -> None:
 
 async def _run_with_heartbeat(
     ws: WebSocket,
+    phase_name: str,
     start_message: str,
     heartbeat_message: str,
     func,
     *args,
     heartbeat_interval_sec: float = 10.0,
 ):
+    started_at = asyncio.get_running_loop().time()
+    heartbeat_count = 0
+    logger.info("phase=%s started", phase_name)
     await _send_partial_status(ws, start_message)
     task = asyncio.create_task(asyncio.to_thread(func, *args))
 
     while True:
         done, _pending = await asyncio.wait({task}, timeout=heartbeat_interval_sec)
         if done:
+            elapsed = asyncio.get_running_loop().time() - started_at
+            logger.info(
+                "phase=%s completed elapsed_sec=%.1f heartbeats=%s",
+                phase_name,
+                elapsed,
+                heartbeat_count,
+            )
             return await task
+        heartbeat_count += 1
+        elapsed = asyncio.get_running_loop().time() - started_at
+        logger.info(
+            "phase=%s in_progress elapsed_sec=%.1f heartbeats=%s",
+            phase_name,
+            elapsed,
+            heartbeat_count,
+        )
         await _send_partial_status(ws, heartbeat_message)
+
+
+@app.on_event("startup")
+async def preload_models_on_startup():
+    if not PRELOAD_MODELS_ON_STARTUP:
+        logger.info("startup preload disabled")
+        return
+
+    logger.info("startup preload started")
+    try:
+        await asyncio.to_thread(_get_model)
+        logger.info("startup preload completed")
+    except Exception:
+        logger.exception("startup preload failed")
 
 
 @app.get("/analytics/health")
@@ -250,8 +315,10 @@ async def ws_transcribe(ws: WebSocket):
             return
 
         try:
+            logger.info("starting wav transcription chunks=%s wav=%s", chunk_count, tmp_wav)
             segments = await _run_with_heartbeat(
                 ws,
+                "transcription",
                 "[partial] transcribing...",
                 "[partial] transcribing...",
                 _transcribe_wav,
@@ -285,6 +352,7 @@ async def ws_transcribe(ws: WebSocket):
             })
 
         transcript_text = " ".join(full_text).strip()
+        logger.info("transcript assembled items=%s chars=%s", len(transcript_items), len(transcript_text))
         if not transcript_text:
             logger.warning("transcription produced empty transcript")
             await _send_error(
@@ -301,8 +369,10 @@ async def ws_transcribe(ws: WebSocket):
         })
 
         try:
+            logger.info("starting summary generation")
             summary_text = await _run_with_heartbeat(
                 ws,
+                "summary",
                 "[partial] generating summary...",
                 "[partial] still generating summary...",
                 summarize_text,
@@ -320,8 +390,10 @@ async def ws_transcribe(ws: WebSocket):
         await ws.send_json({"type": "summary", "text": summary_text})
 
         try:
+            logger.info("starting quiz generation")
             quiz_text = await _run_with_heartbeat(
                 ws,
+                "quiz",
                 "[partial] generating quiz...",
                 "[partial] still generating quiz...",
                 generate_quiz,
@@ -339,8 +411,10 @@ async def ws_transcribe(ws: WebSocket):
         await ws.send_json({"type": "quiz_text", "text": quiz_text or ""})
 
         try:
+            logger.info("starting lesson analytics generation")
             analytics = await _run_with_heartbeat(
                 ws,
+                "analytics",
                 "[partial] generating analytics...",
                 "[partial] still generating analytics...",
                 analyze_transcript,
@@ -356,6 +430,7 @@ async def ws_transcribe(ws: WebSocket):
             )
             return
         await ws.send_json({"type": "analytics", "analytics": analytics})
+        logger.info("lesson processing completed successfully")
     except WebSocketDisconnect:
         pass
     except Exception as e:

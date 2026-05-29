@@ -1,7 +1,13 @@
 import argparse
+import logging
+import os
+import re
 import sys
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from scripts.groq_client import chat_completion
+
+logger = logging.getLogger("ml_service.summary")
+DEFAULT_SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL_NAME", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
 
 
 def read_text(path):
@@ -14,117 +20,102 @@ def write_text(path, text):
         f.write(text)
 
 
-def split_text(text, chunk_size, overlap):
-    text = text.strip()
-    if not text:
+def _normalize_whitespace(text):
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _split_sentences(text):
+    normalized = _normalize_whitespace(text)
+    if not normalized:
         return []
+    parts = re.split(r"(?<=[.!?])\s+", normalized)
+    return [part.strip() for part in parts if part.strip()]
 
-    chunks = []
-    start = 0
-    text_len = len(text)
 
-    while start < text_len:
-        end = min(start + chunk_size, text_len)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= text_len:
+def _dedupe_sentences(sentences):
+    seen = set()
+    result = []
+    for sentence in sentences:
+        key = sentence.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(sentence)
+    return result
+
+
+def heuristic_summarize_text(text, max_items=6):
+    sentences = _dedupe_sentences(_split_sentences(text))
+    if not sentences:
+        raise ValueError("Текст пустой")
+
+    intro = sentences[0]
+    body = []
+    for sentence in sentences[1:]:
+        cleaned = sentence.strip(" -")
+        if len(cleaned) < 12:
+            continue
+        body.append(cleaned)
+        if len(body) >= max_items:
             break
-        start = max(end - overlap, start + 1)
 
-    return chunks
+    summary_lines = ["## Краткий конспект", intro]
+    if body:
+        summary_lines.append("## Основные пункты")
+        summary_lines.extend(f"- {item}" for item in body)
 
-
-def generate_text(tokenizer, model, prompt, max_new_tokens):
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
-
-    result = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return result[len(prompt):].strip() if result.startswith(prompt) else result.strip()
+    return "\n".join(summary_lines).strip()
 
 
-def summarize_chunk(tokenizer, model, chunk, max_new_tokens):
-    prompt = (
-        "Сделай краткое структурированное резюме фрагмента расшифровки на русском языке.\n"
-        "Верни только результат.\n\n"
+def _build_summary_prompt(text: str) -> str:
+    transcript = text.strip()[:18000]
+    return (
+        "Ниже дана транскрибация занятия на русском языке.\n"
+        "Сделай по ней структурированный конспект.\n"
+        "Верни только готовый текст конспекта без пояснений.\n\n"
         "Требования:\n"
-        "- убрать повторы, слова-паразиты и шум устной речи\n"
-        "- сохранить ключевые факты и цифры\n"
-        "- если есть задачи, вынеси их отдельным пунктом\n\n"
-        "Текст:\n"
-        f"{chunk}\n\n"
-        "Конспект:"
-    )
-    return generate_text(tokenizer, model, prompt, max_new_tokens)
-
-
-def summarize_final(tokenizer, model, partial_summaries, max_new_tokens):
-    joined = "\n\n".join(
-        f"Фрагмент {i + 1}:\n{summary}"
-        for i, summary in enumerate(partial_summaries)
+        "- исправь очевидные ошибки распознавания речи по смыслу\n"
+        "- убери повторы, шум устной речи и рекламные вставки\n"
+        "- выдели ключевые определения, шаги решения и итоговые ответы\n"
+        "- используй markdown-заголовки и маркированные списки\n"
+        "- сделай 4-6 крупных смысловых разделов, а не много мелких однотипных пунктов\n"
+        "- внутри каждого раздела давай 2-5 содержательных bullet points, когда это уместно\n"
+        "- не делай отдельный заголовок на каждую одну строку или микрофакт\n"
+        "- если это разбор задачи, опиши решение пошагово\n\n"
+        "Транскрибация:\n"
+        f"{transcript}"
     )
 
-    prompt = (
-        "Ниже даны промежуточные резюме частей одной расшифровки.\n"
-        "Собери из них один итоговый конспект на русском языке.\n"
-        "Верни только итоговый текст.\n\n"
-        "Требования:\n"
-        "- коротко и по делу\n"
-        "- не повторяй одно и то же разными словами\n\n"
-        f"{joined}\n\n"
-        "Итоговый конспект:"
+
+def summarize_text(
+    text,
+    model_name=DEFAULT_SUMMARY_MODEL_NAME,
+):
+    if not text:
+        raise ValueError("Текст пустой")
+
+    provider = os.getenv("SUMMARY_PROVIDER", "groq").strip().lower()
+    logger.info("summary provider=%s chars=%s", provider, len(text))
+    if provider == "heuristic":
+        return heuristic_summarize_text(text)
+    if provider not in {"groq", "llm"}:
+        raise ValueError(f"Unsupported summary provider: {provider}")
+
+    return chat_completion(
+        system_prompt="Ты готовишь аккуратный конспект урока по транскрибации.",
+        user_prompt=_build_summary_prompt(text),
+        model=model_name,
+        max_completion_tokens=int(os.getenv("SUMMARY_MAX_TOKENS", "700")),
+        temperature=float(os.getenv("SUMMARY_TEMPERATURE", "0.1")),
     )
-    return generate_text(tokenizer, model, prompt, max_new_tokens)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="transcript.txt")
     parser.add_argument("--output", default="summary.txt")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--chunk-size", type=int, default=2500)
-    parser.add_argument("--chunk-overlap", type=int, default=200)
-    parser.add_argument("--max-new-tokens", type=int, default=220)
-    parser.add_argument("--final-max-new-tokens", type=int, default=300)
+    parser.add_argument("--model", default=DEFAULT_SUMMARY_MODEL_NAME)
     return parser.parse_args()
-
-
-def summarize_text(
-    text,
-    model_name="Qwen/Qwen2.5-0.5B-Instruct",
-    chunk_size=2500,
-    chunk_overlap=200,
-    max_new_tokens=220,
-    final_max_new_tokens=300,
-):
-    if not text:
-        raise ValueError("Текст пустой")
-
-    chunks = split_text(text, chunk_size, chunk_overlap)
-    if not chunks:
-        raise ValueError("Не удалось разбить текст на части")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-
-    partial_summaries = []
-    for chunk in chunks:
-        summary = summarize_chunk(tokenizer, model, chunk, max_new_tokens)
-        partial_summaries.append(summary)
-
-    final_summary = summarize_final(
-        tokenizer,
-        model,
-        partial_summaries,
-        final_max_new_tokens,
-    )
-    return final_summary
 
 
 def main():
@@ -138,10 +129,6 @@ def main():
         final_summary = summarize_text(
             text,
             model_name=args.model,
-            chunk_size=args.chunk_size,
-            chunk_overlap=args.chunk_overlap,
-            max_new_tokens=args.max_new_tokens,
-            final_max_new_tokens=args.final_max_new_tokens,
         )
 
         write_text(args.output, final_summary)

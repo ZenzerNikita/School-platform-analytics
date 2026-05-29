@@ -1,9 +1,9 @@
 import json
 import os
 import re
-import urllib.error
-import urllib.request
 from typing import Any, Dict, List
+
+from scripts.groq_client import chat_completion
 
 
 METRIC_DEFINITIONS = [
@@ -356,7 +356,7 @@ def analyze_transcript(transcript: Any) -> Dict[str, Any]:
 
     if _should_use_groq():
         try:
-            return _merge_with_groq_analysis(items, baseline)
+            return _merge_with_groq_analysis(items)
         except Exception as exc:
             baseline["fallback_reason"] = str(exc) or exc.__class__.__name__
             return baseline
@@ -614,11 +614,8 @@ def _groq_disabled_reason() -> str:
     return "Groq disabled."
 
 
-def _merge_with_groq_analysis(
-    items: List[Dict[str, Any]],
-    baseline: Dict[str, Any],
-) -> Dict[str, Any]:
-    raw = _call_groq(_analytics_prompt(items, baseline))
+def _merge_with_groq_analysis(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = _call_groq(_analytics_prompt(items))
     parsed = _extract_json(raw)
     normalized = _normalize_llm_analysis(parsed)
     normalized["source"] = "groq"
@@ -626,53 +623,20 @@ def _merge_with_groq_analysis(
 
 
 def _call_groq(prompt: str) -> str:
-    url = os.getenv("GROQ_PROXY_URL", "http://91.103.253.236/generate")
-    api_key = os.getenv("GROQ_API_KEY") or os.getenv("API_KEY_STORAGE")
     model = os.getenv("GROQ_ANALYTICS_MODEL") or os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
-    payload = {
-        "prompt": prompt,
-        "model": model,
-        "temperature": 0.1,
-        "max_tokens": 1400,
-    }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "X-API-Key": api_key,
-        },
-        method="POST",
+    return chat_completion(
+        system_prompt=(
+            "Ты оцениваешь качество проведения урока по транскрибации. "
+            "Нужно строго следовать заданной рубрике и вернуть только валидный JSON."
+        ),
+        user_prompt=prompt,
+        model=model,
+        max_completion_tokens=int(os.getenv("ANALYTICS_MAX_TOKENS", "1600")),
+        temperature=float(os.getenv("ANALYTICS_TEMPERATURE", "0.1")),
     )
-    timeout = float(os.getenv("GROQ_TIMEOUT_SEC", "60"))
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Groq proxy failed: {exc}") from exc
-
-    if not isinstance(data, dict):
-        raise RuntimeError("Groq proxy returned invalid payload")
-
-    for key in ("text", "response", "output", "content", "result"):
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    choices = data.get("choices")
-    if isinstance(choices, list) and choices:
-        first = choices[0]
-        if isinstance(first, dict):
-            message = first.get("message")
-            if isinstance(message, dict) and isinstance(message.get("content"), str):
-                return message["content"].strip()
-            if isinstance(first.get("text"), str):
-                return first["text"].strip()
-
-    raise RuntimeError("Groq proxy response has no generated text")
 
 
-def _analytics_prompt(items: List[Dict[str, Any]], baseline: Dict[str, Any]) -> str:
+def _analytics_prompt(items: List[Dict[str, Any]]) -> str:
     transcript = "\n".join(
         f"[{_format_ms(item.get('start_ms', 0))}] {item['text']}" for item in items
     )
@@ -681,10 +645,10 @@ def _analytics_prompt(items: List[Dict[str, Any]], baseline: Dict[str, Any]) -> 
         f"- {metric['id']}: {metric['title']}, score 0-{metric['max_score']}. {metric['description']}"
         for metric in METRIC_DEFINITIONS
     )
-    baseline_json = json.dumps(baseline, ensure_ascii=False)
     return (
         "Оцени качество проведения занятия по транскрибации.\n"
         "Верни только валидный JSON без markdown.\n"
+        "Оценивай самостоятельно по рубрике, не придумывай дополнительные метрики.\n"
         "Схема ответа:\n"
         "{\n"
         '  "type": "lesson_analytics",\n'
@@ -700,11 +664,10 @@ def _analytics_prompt(items: List[Dict[str, Any]], baseline: Dict[str, Any]) -> 
         "Допустимые id метрик строго такие: "
         + ", ".join(metric["id"] for metric in METRIC_DEFINITIONS)
         + ".\n"
-        "Оценки должны быть только в допустимом диапазоне. Evidence бери короткими цитатами из транскрибации.\n\n"
+        "Оценки должны быть только в допустимом диапазоне. Evidence бери короткими цитатами из транскрибации.\n"
+        "Если по метрике данных недостаточно, ставь низкий балл и явно пиши это в comment.\n\n"
         "Рубрика:\n"
         f"{rubric}\n\n"
-        "Черновая эвристическая оценка, которую можно скорректировать:\n"
-        f"{baseline_json}\n\n"
         "Транскрибация:\n"
         f"{transcript}"
     )

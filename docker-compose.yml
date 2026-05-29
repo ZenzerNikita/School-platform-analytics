@@ -13,6 +13,9 @@ services:
       - ml_service
     ports:
       - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - app_runtime_data:/app/runtime
 
   ml_service:
     build:
@@ -21,17 +24,30 @@ services:
     container_name: adaptive-learning-ml
     restart: unless-stopped
     environment:
-      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-small}
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-tiny}
       WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
-      WHISPER_BEAM_SIZE: ${WHISPER_BEAM_SIZE:-5}
+      WHISPER_BEAM_SIZE: ${WHISPER_BEAM_SIZE:-1}
       WHISPER_VAD_FILTER: ${WHISPER_VAD_FILTER:-true}
+      SUMMARY_PROVIDER: ${SUMMARY_PROVIDER:-groq}
+      SUMMARY_MODEL_NAME: ${SUMMARY_MODEL_NAME:-llama-3.3-70b-versatile}
+      QUIZ_PROVIDER: ${QUIZ_PROVIDER:-groq}
+      QUIZ_MODEL_NAME: ${QUIZ_MODEL_NAME:-llama-3.3-70b-versatile}
+      PRELOAD_MODELS_ON_STARTUP: ${PRELOAD_MODELS_ON_STARTUP:-true}
       LLM_PROVIDER: ${LLM_PROVIDER:-heuristic}
-      ANALYTICS_PROVIDER: ${ANALYTICS_PROVIDER:-auto}
+      ANALYTICS_PROVIDER: ${ANALYTICS_PROVIDER:-groq}
+      GROQ_API_URL: ${GROQ_API_URL:-https://api.groq.com/openai/v1/chat/completions}
       GROQ_PROXY_URL: ${GROQ_PROXY_URL:-http://91.103.253.236/generate}
-      GROQ_MODEL: ${GROQ_MODEL:-qwen/qwen3-32b}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
       GROQ_ANALYTICS_MODEL: ${GROQ_ANALYTICS_MODEL:-qwen/qwen3-32b}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       API_KEY_STORAGE: ${API_KEY_STORAGE:-}
+      HF_HOME: /root/.cache/huggingface
     ports:
       - "8001:8001"
+    volumes:
+      - whisper_hf_cache:/root/.cache/huggingface
+
+volumes:
+  app_runtime_data:
+  whisper_hf_cache:

@@ -1,9 +1,12 @@
 import argparse
-import json
-import re
+import logging
+import os
 import sys
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from scripts.groq_client import chat_completion
+
+logger = logging.getLogger("ml_service.quiz")
+DEFAULT_QUIZ_MODEL_NAME = os.getenv("QUIZ_MODEL_NAME", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
 
 
 def read_text(path):
@@ -11,116 +14,54 @@ def read_text(path):
         return f.read().strip()
 
 
-def write_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
 def write_text(path, text):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
 
 
-def extract_json(text):
-    text = text.strip()
-
-    try:
-        return json.loads(text)
-    except:
-        pass
-
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if not match:
-        raise ValueError("Модель не вернула JSON")
-
-    candidate = match.group(0)
-
-    try:
-        return json.loads(candidate)
-    except Exception as e:
-        raise ValueError(f"Не удалось распарсить JSON: {e}")
+def _summary_lines(summary_text):
+    return [
+        line.strip("•- ").strip()
+        for line in (summary_text or "").splitlines()
+        if line.strip() and not line.strip().startswith("##")
+    ]
 
 
-def validate_quiz(data):
-    if isinstance(data, list):
-        data = {"questions": data}
+def heuristic_generate_quiz(summary_text):
+    facts = _summary_lines(summary_text)
+    if not facts:
+        raise ValueError("Конспект пустой")
 
-    if not isinstance(data, dict):
-        raise ValueError("Корневой JSON должен быть объектом или списком")
-
-    questions = data.get("questions")
-    if not isinstance(questions, list) or len(questions) == 0:
-        raise ValueError("В JSON нет списка questions")
-
-    normalized = []
-
-    for i, item in enumerate(questions, 1):
-        if not isinstance(item, dict):
-            continue
-
-        question = item.get("question")
-        options = item.get("options")
-        correct_answer = item.get("correct_answer")
-        explanation = item.get("explanation", "")
-
-        if not isinstance(question, str) or not question.strip():
-            continue
-
-        if not isinstance(options, list) or len(options) < 2:
-            continue
-
-        cleaned_options = []
-        for option in options:
-            if isinstance(option, str) and option.strip():
-                cleaned_options.append(option.strip())
-
-        if len(cleaned_options) < 2:
-            continue
-
-        cleaned_options = cleaned_options[:4]
-        while len(cleaned_options) < 4:
-            cleaned_options.append(cleaned_options[-1])
-
-        if isinstance(correct_answer, int):
-            idx = max(0, min(3, correct_answer))
-        elif isinstance(correct_answer, str) and correct_answer.strip():
-            try:
-                idx = cleaned_options.index(correct_answer.strip())
-            except ValueError:
-                idx = 0
-        else:
-            idx = 0
-
-        if not isinstance(explanation, str):
-            explanation = str(explanation)
-
-        normalized.append(
-            {
-                "id": i,
-                "question": question.strip(),
-                "options": cleaned_options,
-                "correct_answer": idx,
-                "explanation": explanation.strip(),
-            }
+    picked = facts[:3]
+    blocks = []
+    for index, fact in enumerate(picked, start=1):
+        distractor_base = facts[(index) % len(facts)] if len(facts) > 1 else "Материал не разбирался"
+        options = [
+            fact,
+            distractor_base,
+            "Это не упоминалось в занятии",
+            "Точного ответа в конспекте нет",
+        ]
+        blocks.append(
+            "\n".join([
+                f"Вопрос {index}: Что верно по материалам занятия?",
+                f"A) {options[0]}",
+                f"B) {options[1]}",
+                f"C) {options[2]}",
+                f"D) {options[3]}",
+                "Правильный ответ: A",
+            ])
         )
-
-        if len(normalized) >= 5:
-            break
-
-    if not normalized:
-        raise ValueError("Не удалось нормализовать вопросы")
-
-    return {
-        "title": data.get("title", "Домашнее задание"),
-        "questions": normalized,
-    }
+    return "\n\n".join(blocks).strip()
 
 
-def build_prompt(summary_text):
+def _build_quiz_prompt(summary_text: str) -> str:
+    summary = summary_text.strip()[:14000]
     return (
-        "Составь небольшой тест по конспекту.\n"
-        "Верни чистый текст без JSON и без markdown.\n"
-        "Формат:\n"
+        "Ниже дан конспект занятия на русском языке.\n"
+        "Составь по нему небольшой тест для ученика.\n"
+        "Верни только чистый текст без JSON и без markdown-обрамления.\n\n"
+        "Формат строго такой:\n"
         "Вопрос 1: ...\n"
         "A) ...\n"
         "B) ...\n"
@@ -133,72 +74,45 @@ def build_prompt(summary_text):
         "C) ...\n"
         "D) ...\n"
         "Правильный ответ: B\n\n"
-        "Сделай 3-5 вопросов.\n\n"
+        "Требования:\n"
+        "- сделай 3-5 вопросов\n"
+        "- вопросы должны проверять понимание темы, а не формальные мелочи\n"
+        "- неправильные варианты должны быть правдоподобными\n"
+        "- не добавляй пояснений до или после теста\n\n"
         "Конспект:\n"
-        f"{summary_text}\n\n"
-        "Тест:"
+        f"{summary}"
     )
 
 
-def generate_text(tokenizer, model, prompt, max_new_tokens):
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+def generate_quiz(
+    summary_text,
+    model_name=DEFAULT_QUIZ_MODEL_NAME,
+):
+    if not summary_text:
+        raise ValueError("Конспект пустой")
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
+    provider = os.getenv("QUIZ_PROVIDER", "groq").strip().lower()
+    logger.info("quiz provider=%s chars=%s", provider, len(summary_text))
+    if provider == "heuristic":
+        return heuristic_generate_quiz(summary_text)
+    if provider not in {"groq", "llm"}:
+        raise ValueError(f"Unsupported quiz provider: {provider}")
 
-    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    if decoded.startswith(prompt):
-        return decoded[len(prompt):].strip()
-    return decoded.strip()
+    return chat_completion(
+        system_prompt="Ты создаешь короткие качественные учебные тесты по конспекту урока.",
+        user_prompt=_build_quiz_prompt(summary_text),
+        model=model_name,
+        max_completion_tokens=int(os.getenv("QUIZ_MAX_TOKENS", "900")),
+        temperature=float(os.getenv("QUIZ_TEMPERATURE", "0.2")),
+    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="summary.txt")
-    parser.add_argument("--output", default="quiz.json")
-    parser.add_argument("--raw-output", default="quiz_raw.txt")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--max-new-tokens", type=int, default=900)
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--output", default="quiz.txt")
+    parser.add_argument("--model", default=DEFAULT_QUIZ_MODEL_NAME)
     return parser.parse_args()
-
-
-def generate_quiz(
-    summary_text,
-    model_name="Qwen/Qwen2.5-0.5B-Instruct",
-    max_new_tokens=400,
-    retries=1,
-):
-    if not summary_text:
-        raise ValueError("Конспект пустой")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-
-    prompt = build_prompt(summary_text)
-
-    last_error = None
-    last_raw_output = ""
-
-    for attempt in range(1, retries + 2):
-        print(f"[attempt {attempt}] generate quiz", file=sys.stderr)
-
-        raw_output = generate_text(
-            tokenizer,
-            model,
-            prompt,
-            max_new_tokens,
-        )
-
-        last_raw_output = raw_output.strip()
-        if last_raw_output:
-            return last_raw_output
-
-    return last_raw_output
 
 
 def main():
@@ -212,11 +126,9 @@ def main():
         quiz = generate_quiz(
             summary_text,
             model_name=args.model,
-            max_new_tokens=args.max_new_tokens,
-            retries=args.retries,
         )
-        write_json(args.output, quiz)
-        print(json.dumps(quiz, ensure_ascii=False, indent=2))
+        write_text(args.output, quiz)
+        print(quiz)
 
     except Exception as e:
         print(str(e), file=sys.stderr)

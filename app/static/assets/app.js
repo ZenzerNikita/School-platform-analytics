@@ -39,6 +39,7 @@ let quizEditorState = null;
 let quizEditorDirty = false;
 let quizEditorTaskId = "";
 let streamCompletedSuccessfully = false;
+let analyticsPollTimer = null;
 
 const requestedTaskId = new URL(window.location.href).searchParams.get("task_id") || "";
 
@@ -218,6 +219,13 @@ function setTabsEnabled(summaryReady, quizReady, analyticsReady) {
   if (analyticsTabBtn) {
     analyticsTabBtn.disabled = !analyticsReady;
     analyticsTabBtn.style.opacity = analyticsReady ? "1" : "0.5";
+  }
+}
+
+function clearAnalyticsPolling() {
+  if (analyticsPollTimer) {
+    clearTimeout(analyticsPollTimer);
+    analyticsPollTimer = null;
   }
 }
 
@@ -624,13 +632,47 @@ function renderQuiz(test = null, quizText = "", status = "") {
   }, 30);
 }
 
-function renderAnalytics(analytics, status = "") {
-  if (!analytics && status !== "done") {
-    analyticsContainer.innerHTML = statusMessage("Аналитика появится после обработки занятия");
+function renderAnalytics(task) {
+  const analytics = task?.analytics || null;
+  const status = task?.status || "";
+  const jobStatus = task?.analytics_job_status || "";
+  const jobError = task?.analytics_job_error;
+  const transcriptReady = Array.isArray(task?.transcript) && task.transcript.length > 0;
+
+  if (!analytics && !transcriptReady && !["queued", "processing", "failed"].includes(jobStatus)) {
+    analyticsContainer.innerHTML = statusMessage("Аналитика станет доступна после появления транскрипта занятия");
     return;
   }
+
+  if (!analytics && ["queued", "processing"].includes(jobStatus)) {
+    analyticsContainer.innerHTML = `
+      <div class="analytics-card">
+        <div class="analytics-title">Анализ запущен</div>
+        <div class="status-message">
+          <span class="spinner-small"></span>
+          Анализируем транскрипт преподавателя. Статус: ${escapeHtml(jobStatus)}.
+        </div>
+      </div>
+    `;
+    attachAnalyticsActionHandlers(task);
+    return;
+  }
+
   if (!analytics) {
-    analyticsContainer.innerHTML = statusMessage("Аналитика пока не сформирована.");
+    const detail = jobError?.detail ? `<div class="status-message">${escapeHtml(jobError.detail)}</div>` : "";
+    analyticsContainer.innerHTML = `
+      <div class="analytics-card">
+        <div class="analytics-title">Аналитика занятия</div>
+        <div class="analytics-subtopic">Анализ больше не строится внутри общего пайплайна и запускается отдельным запросом.</div>
+        ${detail}
+        <div style="margin-top: 16px;">
+          <button id="startAnalyticsBtn" class="btn-secondary" type="button">
+            ${jobStatus === "failed" ? "Запустить повторно" : "Запустить аналитику"}
+          </button>
+        </div>
+      </div>
+    `;
+    attachAnalyticsActionHandlers(task);
     return;
   }
 
@@ -715,6 +757,13 @@ function renderAnalytics(analytics, status = "") {
   analyticsContainer.innerHTML = `
     <div class="analytics-stack">
       <div class="analytics-card">
+        <div class="analytics-title">Управление анализом</div>
+        <div class="analytics-subtopic">Аналитика вызывается отдельным запросом по готовому транскрипту.</div>
+        <div style="margin-top: 16px;">
+          <button id="startAnalyticsBtn" class="btn-secondary" type="button">Пересчитать аналитику</button>
+        </div>
+      </div>
+      <div class="analytics-card">
         <div class="analytics-title">Итоговая оценка занятия</div>
         <div class="analytics-row">
           <div class="analytics-subtopic">Суммарный балл по рубрике</div>
@@ -734,6 +783,7 @@ function renderAnalytics(analytics, status = "") {
       </div>
     </div>
   `;
+  attachAnalyticsActionHandlers(task);
 }
 
 function updateActiveTabContent(task) {
@@ -743,7 +793,7 @@ function updateActiveTabContent(task) {
   if (tab === "transcript") renderTranscript(task);
   if (tab === "summary") renderSummary(task?.summary || [], task?.status || "");
   if (tab === "quiz") renderQuiz(task?.test || null, task?.quiz_text || "", task?.status || "");
-  if (tab === "analytics") renderAnalytics(task?.analytics, task?.status || "");
+  if (tab === "analytics") renderAnalytics(task);
 }
 
 function applyTaskState(task) {
@@ -755,7 +805,8 @@ function applyTaskState(task) {
   }
   const summaryReady = Array.isArray(task.summary) && task.summary.length > 0;
   const quizReady = Boolean(task.quiz_text || task.test);
-  const analyticsReady = Boolean(task.analytics);
+  const transcriptReady = Array.isArray(task.transcript) && task.transcript.length > 0;
+  const analyticsReady = transcriptReady || Boolean(task.analytics) || task.status === "done" || ["queued", "processing", "failed"].includes(task.analytics_job_status || "");
   if (quizReady) {
     syncQuizEditorState(task);
   } else {
@@ -769,6 +820,7 @@ function applyTaskState(task) {
     if (editQuizBtn.parentElement) editQuizBtn.parentElement.hidden = true;
   }
   updateActiveTabContent(task);
+  maybeResumeAnalyticsPolling(task);
 
   if (task.status === "done") {
     renderReadyStatus(task);
@@ -805,6 +857,77 @@ async function fetchJson(url, options = {}) {
     throw new Error(body.detail || `Request failed: ${res.status}`);
   }
   return res.json();
+}
+
+async function startAnalyticsJob() {
+  if (!lastTask?.id) return;
+  clearAnalyticsPolling();
+  try {
+    const response = await fetchJson(`/api/tasks/${encodeURIComponent(lastTask.id)}/analytics`, {
+      method: "POST",
+    });
+    if (response.task) {
+      applyTaskState(response.task);
+    }
+    if (response.job_id) {
+      scheduleAnalyticsPoll(response.job_id);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Не удалось запустить аналитику.";
+    analyticsContainer.innerHTML = statusMessage(message);
+  }
+}
+
+function scheduleAnalyticsPoll(jobId) {
+  if (!lastTask?.id || !jobId) return;
+  clearAnalyticsPolling();
+  analyticsPollTimer = setTimeout(() => {
+    pollAnalyticsJob(jobId);
+  }, 2000);
+}
+
+async function pollAnalyticsJob(jobId) {
+  if (!lastTask?.id || !jobId) return;
+  try {
+    const response = await fetchJson(`/api/tasks/${encodeURIComponent(lastTask.id)}/analytics/${encodeURIComponent(jobId)}`);
+    if (response.task) {
+      applyTaskState(response.task);
+    }
+    if (["queued", "processing"].includes(response.status)) {
+      scheduleAnalyticsPoll(jobId);
+    } else {
+      clearAnalyticsPolling();
+    }
+  } catch (error) {
+    clearAnalyticsPolling();
+    const message = error instanceof Error ? error.message : "Не удалось получить статус аналитики.";
+    if (lastTask) {
+      renderAnalytics({
+        ...lastTask,
+        analytics_job_status: "failed",
+        analytics_job_error: { detail: message },
+      });
+    } else {
+      analyticsContainer.innerHTML = statusMessage(message);
+    }
+  }
+}
+
+function maybeResumeAnalyticsPolling(task) {
+  if (!task?.id || !task?.analytics_job_id) return;
+  if (!["queued", "processing"].includes(task.analytics_job_status || "")) {
+    clearAnalyticsPolling();
+    return;
+  }
+  if (analyticsPollTimer) return;
+  scheduleAnalyticsPoll(task.analytics_job_id);
+}
+
+function attachAnalyticsActionHandlers(task) {
+  document.getElementById("startAnalyticsBtn")?.addEventListener("click", () => {
+    if (!task?.id) return;
+    startAnalyticsJob();
+  });
 }
 
 async function loadTask(taskId) {
@@ -889,6 +1012,9 @@ async function streamFileToWs(file) {
         test: null,
         quiz_text: "",
         analytics: null,
+        analytics_job_id: null,
+        analytics_job_status: null,
+        analytics_job_error: null,
         status: "processing",
         progress: 0,
       };
@@ -905,14 +1031,16 @@ async function streamFileToWs(file) {
       if (msg.type === "quiz_text") {
         task.test = msg.test || null;
         task.quiz_text = msg.text || "";
-        task.status = task.analytics ? "done" : "processing";
+        task.status = "done";
         applyTaskState(task);
         return;
       }
 
       if (msg.type === "analytics") {
         task.analytics = msg.analytics || null;
-        task.status = task.quiz_text ? "done" : "processing";
+        task.analytics_job_status = "completed";
+        task.analytics_job_error = null;
+        task.status = "done";
         applyTaskState(task);
         return;
       }
@@ -957,6 +1085,7 @@ function resetUpload() {
   currentTaskId = "";
   streamFailed = false;
   streamCompletedSuccessfully = false;
+  clearAnalyticsPolling();
   quizEditorState = null;
   quizEditorDirty = false;
   quizEditorTaskId = "";

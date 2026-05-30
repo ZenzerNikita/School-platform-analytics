@@ -7,6 +7,7 @@ services:
     restart: unless-stopped
     environment:
       ML_WS_URL: ws://ml_service:8001/transcriber/ws/transcribe
+      ML_API_BASE_URL: http://ml_service:8001
       ML_WS_TIMEOUT_SEC: "300"
       INIT_TIMEOUT_SEC: "30"
     depends_on:
@@ -43,11 +44,15 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       API_KEY_STORAGE: ${API_KEY_STORAGE:-}
       HF_HOME: /root/.cache/huggingface
+      ML_STORAGE_DIR: /app/runtime
     ports:
       - "8001:8001"
     volumes:
+      - ./ml_service:/app
       - whisper_hf_cache:/root/.cache/huggingface
+      - ml_runtime_data:/app/runtime
 
 volumes:
   app_runtime_data:
   whisper_hf_cache:
+  ml_runtime_data:

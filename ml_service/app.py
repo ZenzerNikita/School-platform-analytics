@@ -4,8 +4,10 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
+import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -39,6 +41,79 @@ PRELOAD_MODELS_ON_STARTUP = os.getenv("PRELOAD_MODELS_ON_STARTUP", "true").strip
 }
 
 _WHISPER_MODEL: Optional[WhisperModel] = None
+ANALYTICS_JOBS: Dict[str, Dict[str, Any]] = {}
+ML_STORAGE_DIR = Path(os.getenv("ML_STORAGE_DIR", "/app/runtime"))
+ANALYTICS_JOBS_STATE_PATH = ML_STORAGE_DIR / "analytics_jobs.json"
+
+
+def _persist_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_json(path: Path) -> Optional[object]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("failed to load persisted json from %s", path)
+        return None
+
+
+def _persist_analytics_jobs() -> None:
+    serializable_jobs = {
+        job_id: {
+            "job_id": job.get("job_id", job_id),
+            "status": job.get("status"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+            "result": job.get("result"),
+            "error": job.get("error"),
+        }
+        for job_id, job in ANALYTICS_JOBS.items()
+    }
+    _persist_json(ANALYTICS_JOBS_STATE_PATH, serializable_jobs)
+
+
+def _restore_analytics_jobs() -> None:
+    stored_jobs = _load_json(ANALYTICS_JOBS_STATE_PATH)
+    if not isinstance(stored_jobs, dict):
+        return
+
+    ANALYTICS_JOBS.clear()
+    restored_count = 0
+    now = time.time()
+    for job_id, raw_job in stored_jobs.items():
+        if not isinstance(raw_job, dict):
+            continue
+
+        restored_job = {
+            "job_id": raw_job.get("job_id", str(job_id)),
+            "status": raw_job.get("status", "failed"),
+            "created_at": raw_job.get("created_at", now),
+            "updated_at": raw_job.get("updated_at", now),
+            "result": raw_job.get("result"),
+            "error": raw_job.get("error"),
+        }
+        if restored_job["status"] in {"queued", "processing"}:
+            restored_job["status"] = "failed"
+            restored_job["result"] = None
+            restored_job["error"] = {
+                "code": "JOB_INTERRUPTED",
+                "detail": "Сервис был перезапущен до завершения анализа.",
+            }
+            restored_job["updated_at"] = now
+
+        ANALYTICS_JOBS[str(job_id)] = restored_job
+        restored_count += 1
+
+    if restored_count:
+        logger.info("restored analytics jobs count=%s", restored_count)
+        _persist_analytics_jobs()
 
 
 def _resolve_whisper_model_source(model_name: str) -> str:
@@ -152,6 +227,46 @@ def _error_response(code: str, detail: str, status_code: int) -> JSONResponse:
     )
 
 
+def _analytics_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+    }
+    if job.get("result") is not None:
+        payload["result"] = job["result"]
+    if job.get("error") is not None:
+        payload["error"] = job["error"]
+    return payload
+
+
+async def _run_analytics_job(job_id: str, transcript: Any) -> None:
+    job = ANALYTICS_JOBS.get(job_id)
+    if not job:
+        return
+
+    job["status"] = "processing"
+    job["updated_at"] = time.time()
+    _persist_analytics_jobs()
+    try:
+        result = await asyncio.to_thread(analyze_transcript, transcript)
+        job["status"] = "completed"
+        job["result"] = result
+        job["error"] = None
+    except Exception:
+        logger.exception("analytics job failed job_id=%s", job_id)
+        job["status"] = "failed"
+        job["result"] = None
+        job["error"] = {
+            "code": "ANALYTICS_FAILED",
+            "detail": "Не удалось сформировать аналитику занятия.",
+        }
+    finally:
+        job["updated_at"] = time.time()
+        _persist_analytics_jobs()
+
+
 async def _send_partial_status(ws: WebSocket, text: str) -> None:
     await ws.send_json({
         "text": text,
@@ -199,6 +314,7 @@ async def _run_with_heartbeat(
 
 @app.on_event("startup")
 async def preload_models_on_startup():
+    _restore_analytics_jobs()
     if not PRELOAD_MODELS_ON_STARTUP:
         logger.info("startup preload disabled")
         return
@@ -225,24 +341,37 @@ async def analytics_health():
     }
 
 
-@app.post("/analytics/analyze")
-async def analyze_lesson(payload: Any = Body(...)):
+@app.post("/transcript/analyze/")
+async def create_transcript_analysis_job(payload: Any = Body(...)):
     try:
         transcript = normalize_transcript_payload(payload)
     except ValueError as exc:
         return _error_response("VALIDATION_ERROR", str(exc), 400)
 
-    try:
-        analytics = await asyncio.to_thread(analyze_transcript, transcript)
-    except Exception:
-        logger.exception("lesson analytics failed")
-        return _error_response(
-            "ANALYTICS_FAILED",
-            "Не удалось сформировать аналитику занятия.",
-            500,
-        )
+    job_id = str(uuid.uuid4())
+    now = time.time()
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "result": None,
+        "error": None,
+    }
+    ANALYTICS_JOBS[job_id] = job
+    _persist_analytics_jobs()
+    asyncio.create_task(_run_analytics_job(job_id, transcript))
+    payload = _analytics_job_payload(job)
+    payload["poll_url"] = f"/transcript/analyze/{job_id}"
+    return JSONResponse(status_code=202, content=payload)
 
-    return {"analytics": analytics}
+
+@app.get("/transcript/analyze/{job_id}")
+async def get_transcript_analysis_job(job_id: str):
+    job = ANALYTICS_JOBS.get(job_id)
+    if not job:
+        return _error_response("JOB_NOT_FOUND", "Задача анализа не найдена.", 404)
+    return _analytics_job_payload(job)
 
 
 @app.websocket("/transcriber/ws/transcribe")
@@ -410,27 +539,7 @@ async def ws_transcribe(ws: WebSocket):
             return
         await ws.send_json({"type": "quiz_text", "text": quiz_text or ""})
 
-        try:
-            logger.info("starting lesson analytics generation")
-            analytics = await _run_with_heartbeat(
-                ws,
-                "analytics",
-                "[partial] generating analytics...",
-                "[partial] still generating analytics...",
-                analyze_transcript,
-                transcript_items,
-            )
-        except Exception:
-            logger.exception("lesson analytics failed")
-            await _send_error(
-                ws,
-                "ANALYTICS_FAILED",
-                "Не удалось сформировать аналитику занятия.",
-                500,
-            )
-            return
-        await ws.send_json({"type": "analytics", "analytics": analytics})
-        logger.info("lesson processing completed successfully")
+        logger.info("lesson processing completed successfully without analytics stage")
     except WebSocketDisconnect:
         pass
     except Exception as e:

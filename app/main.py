@@ -7,12 +7,14 @@ import time
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import websockets
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
@@ -42,8 +44,10 @@ CHUNK_SIZE = 5
 CHUNK_INTERVAL_SEC = 1
 
 ML_WS_URL = os.getenv("ML_WS_URL", "ws://127.0.0.1:8001/transcriber/ws/transcribe")
+ML_API_BASE_URL = os.getenv("ML_API_BASE_URL", "http://127.0.0.1:8001").rstrip("/")
 ML_WS_TIMEOUT_SEC = float(os.getenv("ML_WS_TIMEOUT_SEC", "300"))
 INIT_TIMEOUT_SEC = float(os.getenv("INIT_TIMEOUT_SEC", "30"))
+ML_HTTP_TIMEOUT_SEC = float(os.getenv("ML_HTTP_TIMEOUT_SEC", "60"))
 
 logger = logging.getLogger("ws_proxy")
 logging.basicConfig(level=logging.INFO)
@@ -204,6 +208,9 @@ def _task_payload(task: dict) -> dict:
         "test": task["test"],
         "quiz_text": task.get("quiz_text", ""),
         "analytics": task.get("analytics"),
+        "analytics_job_id": task.get("analytics_job_id"),
+        "analytics_job_status": task.get("analytics_job_status"),
+        "analytics_job_error": task.get("analytics_job_error"),
         "error": task.get("error"),
         "error_code": task.get("error_code"),
         "error_status_code": task.get("error_status_code"),
@@ -285,6 +292,57 @@ def _publish_task_materials(task: dict) -> None:
     PUBLISHED_MATERIALS["analytics"] = task.get("analytics")
     PUBLISHED_MATERIALS["updated_at"] = task["updated_at"]
     _persist_state()
+
+
+def _ml_http_json_request_sync(
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+    timeout_sec: float = ML_HTTP_TIMEOUT_SEC,
+) -> tuple[int, dict]:
+    request_body = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib_request.Request(
+        f"{ML_API_BASE_URL}{path}",
+        data=request_body,
+        method=method,
+        headers=headers,
+    )
+
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_sec) as response:
+            raw_body = response.read().decode("utf-8")
+            status_code = int(response.status)
+    except urllib_error.HTTPError as exc:
+        raw_body = exc.read().decode("utf-8")
+        status_code = int(exc.code)
+    except urllib_error.URLError as exc:
+        raise RuntimeError(str(exc.reason) or "ML API unavailable") from exc
+
+    try:
+        decoded = json.loads(raw_body) if raw_body else {}
+    except Exception:
+        decoded = {}
+    return status_code, decoded if isinstance(decoded, dict) else {}
+
+
+async def _ml_http_json_request(
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+    timeout_sec: float = ML_HTTP_TIMEOUT_SEC,
+) -> tuple[int, dict]:
+    return await asyncio.to_thread(
+        _ml_http_json_request_sync,
+        method,
+        path,
+        payload,
+        timeout_sec,
+    )
 
 
 def _student_payload(task: dict) -> dict:
@@ -573,6 +631,110 @@ async def get_student_material(task_id: str):
     return _student_payload(task)
 
 
+@app.post("/api/tasks/{task_id}/analytics")
+async def request_task_analytics(task_id: str):
+    task = TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if not task.get("transcript"):
+        raise HTTPException(status_code=409, detail="transcript is not ready yet")
+
+    if task.get("analytics_job_id") and task.get("analytics_job_status") in {"queued", "processing"}:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": task.get("analytics_job_id"),
+                "status": task.get("analytics_job_status"),
+                "task": _task_payload(task),
+                "poll_url": f"/api/tasks/{task_id}/analytics/{task.get('analytics_job_id')}",
+            },
+        )
+
+    try:
+        status_code, response_payload = await _ml_http_json_request(
+            "POST",
+            "/transcript/analyze/",
+            {"transcript": task.get("transcript", [])},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"analytics service unavailable: {exc}") from exc
+
+    if status_code != 202:
+        detail = response_payload.get("detail") or response_payload.get("error") or "analytics request failed"
+        raise HTTPException(status_code=status_code or 500, detail=detail)
+
+    task["analytics_job_id"] = response_payload.get("job_id")
+    task["analytics_job_status"] = response_payload.get("status", "queued")
+    task["analytics_job_error"] = None
+    task["updated_at"] = time.time()
+    _persist_state()
+    await _broadcast_task(task_id)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": task["analytics_job_id"],
+            "status": task["analytics_job_status"],
+            "task": _task_payload(task),
+            "poll_url": f"/api/tasks/{task_id}/analytics/{task['analytics_job_id']}",
+        },
+    )
+
+
+@app.get("/api/tasks/{task_id}/analytics/{job_id}")
+async def poll_task_analytics(task_id: str, job_id: str):
+    task = TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.get("analytics_job_id") and task.get("analytics_job_id") != job_id:
+        raise HTTPException(status_code=409, detail="analytics job mismatch")
+
+    try:
+        status_code, response_payload = await _ml_http_json_request(
+            "GET",
+            f"/transcript/analyze/{job_id}",
+            None,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=f"analytics service unavailable: {exc}") from exc
+
+    if status_code == 404:
+        task["analytics_job_id"] = job_id
+        task["analytics_job_status"] = "failed"
+        task["analytics_job_error"] = {
+            "code": "JOB_NOT_FOUND",
+            "detail": "Задача анализа не найдена.",
+        }
+        task["updated_at"] = time.time()
+        _persist_state()
+        await _broadcast_task(task_id)
+        raise HTTPException(status_code=404, detail="analytics job not found")
+
+    if status_code >= 400:
+        detail = response_payload.get("detail") or response_payload.get("error") or "analytics poll failed"
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    task["analytics_job_id"] = response_payload.get("job_id", job_id)
+    task["analytics_job_status"] = response_payload.get("status")
+    task["analytics_job_error"] = response_payload.get("error")
+    if response_payload.get("status") == "completed":
+        task["analytics"] = response_payload.get("result")
+        task["updated_at"] = time.time()
+        _publish_task_materials(task)
+    else:
+        task["updated_at"] = time.time()
+        _persist_state()
+    await _broadcast_task(task_id)
+
+    return {
+        "job_id": task["analytics_job_id"],
+        "status": task["analytics_job_status"],
+        "result": task.get("analytics") if task.get("analytics_job_status") == "completed" else None,
+        "error": task.get("analytics_job_error"),
+        "task": _task_payload(task),
+    }
+
+
 async def _check_ml_available() -> bool:
     try:
         async with websockets.connect(
@@ -709,6 +871,9 @@ async def ws_stream_proxy(client_ws: WebSocket):
         "test": None,
         "quiz_text": "",
         "analytics": None,
+        "analytics_job_id": None,
+        "analytics_job_status": None,
+        "analytics_job_error": None,
         "error": None,
         "error_code": None,
         "error_status_code": None,
